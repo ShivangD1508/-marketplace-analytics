@@ -1,0 +1,24 @@
+# Raw data is regenerated, never committed: ~70 MB of CSV that the seeded
+# generator reproduces byte for byte in six seconds.
+data/raw/
+data/*.duckdb
+data/*.duckdb.wal
+
+# dbt build output
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# dbt anonymous-usage id, machine-local
+dbt/.user.yml

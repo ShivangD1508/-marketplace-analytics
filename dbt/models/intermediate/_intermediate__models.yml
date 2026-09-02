@@ -1,0 +1,198 @@
+version: 2
+
+models:
+  - name: int_events
+    description: >
+      The long event table. One row per (order, event_name), built by collapsing
+      the wide lifecycle tables into a single stream with a stable taxonomy.
+
+      Incremental by design: `delete+insert` on `event_id`, with an order-level
+      restatement window of `events_lookback_days` (default 45). The window
+      exists because a lifecycle timestamp lands days or weeks after the order it
+      belongs to -- filtering on the high-water mark of `event_ts` alone would
+      permanently miss the delivery of an order placed before that mark. Because
+      `event_id` is a deterministic hash of (order_id, event_name), re-running
+      the window rewrites rows rather than duplicating them, so the model is
+      idempotent and `--full-refresh` and incremental runs agree.
+
+      Provenance is explicit on every row: `ts_is_derived` marks events whose
+      timestamp was borrowed because the source has none, `is_unobserved_step`
+      marks steps the order demonstrably reached but for which no timestamp was
+      recorded, and `is_out_of_order` marks events stamped earlier than
+      something that canonically precedes them.
+    columns:
+      - name: event_id
+        description: Surrogate key, md5(order_id, event_name). Deterministic, which is what makes the incremental rewrite idempotent.
+        data_tests: [unique, not_null]
+      - name: event_name
+        description: Event taxonomy. See README "Event schema" for why each one exists.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values:
+                  - order_placed
+                  - payment_confirmed
+                  - order_approved
+                  - order_shipped
+                  - order_delivered
+                  - order_canceled
+                  - order_unavailable
+                  - review_requested
+                  - review_submitted
+      - name: event_ts
+        description: When the event happened. Borrowed where ts_is_derived is true.
+        data_tests: [not_null]
+      - name: event_date
+        data_tests: [not_null]
+      - name: lifecycle_rank
+        description: Canonical position in the order lifecycle. Ordering is by this, never by timestamp.
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 1
+                max_value: 7
+      - name: event_seq_in_order
+        description: Dense position of this event within its order, by lifecycle_rank.
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 1
+      - name: actor_type
+        description: Who acted. 'system' covers automated steps (payment gateway approval, carrier delivery) that neither marketplace side performs.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [buyer, seller, system]
+      - name: actor_id
+        description: >
+          The acting party's stable identity: customer_unique_id for buyers,
+          seller_id for single-seller shipments. Null for system events and for
+          multi-seller shipments, where no single seller is the actor.
+      - name: customer_unique_id
+        description: Person-level buyer identity. Present on every event, including system ones, so any event can be attributed to a buyer.
+        data_tests: [not_null]
+      - name: customer_id
+        description: Order-scoped customer handle, carried for lineage back to the raw file only.
+        data_tests: [not_null]
+      - name: order_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_orders')
+                field: order_id
+      - name: order_placed_at
+        description: Denormalised onto every event so downstream models never need to self-join to find the order's anchor time.
+        data_tests: [not_null]
+      - name: hours_since_order_placed
+        description: Event age relative to its order. Never negative -- see tests/assert_no_event_precedes_order_placed.sql.
+        data_tests: [not_null]
+      - name: ts_is_derived
+        description: True where the source carries no timestamp for this event and one was borrowed. Always excludable in a single predicate.
+        data_tests: [not_null]
+      - name: is_unobserved_step
+        description: True where the order reached this step but the timestamp was not recorded.
+        data_tests: [not_null]
+      - name: is_out_of_order
+        description: True where this event is stamped earlier than a canonically preceding one. Flagged, never silently reordered.
+        data_tests: [not_null]
+      - name: properties
+        description: Event-type-specific payload, JSON encoded as text. Anything not meaningful for every event type lives here rather than as a column.
+        data_tests: [not_null]
+      - name: source_table
+        data_tests: [not_null]
+      - name: customer_region
+        data_tests: [not_null]
+      - name: dbt_ingested_at
+        description: Run timestamp of the dbt invocation that wrote the row.
+        data_tests: [not_null]
+    data_tests:
+      - unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [order_id, event_name]
+      - expression_is_true:
+          name: int_events_derived_ts_only_where_source_lacks_one
+          arguments:
+            expression: >
+              not ts_is_derived
+              or event_name in ('payment_confirmed', 'order_approved', 'order_shipped',
+                                'order_delivered', 'order_canceled', 'order_unavailable')
+      - expression_is_true:
+          name: int_events_buyer_events_carry_an_actor
+          arguments:
+            expression: "actor_type <> 'buyer' or actor_id is not null"
+      - expression_is_true:
+          name: int_events_system_events_carry_no_actor
+          arguments:
+            expression: "actor_type <> 'system' or actor_id is null"
+      - expression_is_true:
+          name: int_events_properties_are_valid_json
+          arguments:
+            expression: "json_valid(properties)"
+
+  - name: int_sessions
+    description: >
+      Buyer sessions, one row each. Built from buyer-initiated events with real
+      (non-derived) timestamps, split on a gap of `session_inactivity_minutes`.
+      The rules and the reasoning behind each are in the model header and in
+      README "Sessions".
+    columns:
+      - name: session_id
+        data_tests: [unique, not_null]
+      - name: customer_unique_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_customers')
+                field: customer_unique_id
+      - name: session_number_for_buyer
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 1
+      - name: session_started_at
+        data_tests: [not_null]
+      - name: session_ended_at
+        data_tests: [not_null]
+      - name: session_duration_minutes
+        description: Bounded above by the inactivity threshold times the number of gaps in the session.
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 0
+      - name: event_count
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 1
+      - name: session_type
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [purchase, review, mixed]
+      - name: session_gross_value
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+    data_tests:
+      - unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [customer_unique_id, session_number_for_buyer]
+      - expression_is_true:
+          name: int_sessions_end_not_before_start
+          arguments:
+            expression: "session_ended_at >= session_started_at"
+      - expression_is_true:
+          name: int_sessions_duration_within_inactivity_bound
+          arguments:
+            expression: "session_duration_minutes <= {{ var('session_inactivity_minutes') }} * (event_count - 1) + 0.001"

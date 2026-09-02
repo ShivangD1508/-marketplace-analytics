@@ -1,0 +1,10 @@
+# Pinned to minors so a CI run a year from now still reproduces this build.
+dbt-core~=1.12.3
+dbt-duckdb~=1.11.0
+duckdb~=1.5.5
+pandas~=3.0.0
+numpy~=2.4.0
+matplotlib~=3.11.0
+
+# Orchestration. Not needed for `dbt build`; install with
+#   pip install -r orchestration/requirements.txt
