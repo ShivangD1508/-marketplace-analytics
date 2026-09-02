@@ -22,8 +22,16 @@ models:
       something that canonically precedes them.
     columns:
       - name: event_id
-        description: Surrogate key, md5(order_id, event_name). Deterministic, which is what makes the incremental rewrite idempotent.
+        description: >
+          Surrogate key, md5(order_id, event_name, event_source_id).
+          Deterministic, which is what makes the incremental rewrite idempotent.
         data_tests: [unique, not_null]
+      - name: event_source_id
+        description: >
+          What distinguishes repeat occurrences of the same event for one order:
+          review_id on the review events, null on the lifecycle events, which
+          happen at most once per order. Part of the grain and of event_id --
+          547 orders really do carry more than one review.
       - name: event_name
         description: Event taxonomy. See README "Event schema" for why each one exists.
         data_tests:
@@ -89,7 +97,16 @@ models:
         description: Denormalised onto every event so downstream models never need to self-join to find the order's anchor time.
         data_tests: [not_null]
       - name: hours_since_order_placed
-        description: Event age relative to its order. Never negative -- see tests/assert_no_event_precedes_order_placed.sql.
+        description: >
+          Signed event age relative to its order. Negative for the 166 events
+          the source stamped before their own order; those carry
+          is_before_order_placed = true. Filter on that flag before aggregating.
+        data_tests: [not_null]
+      - name: is_before_order_placed
+        description: >
+          True where this event is stamped before its order was placed. A source
+          defect, named rather than clamped -- see
+          tests/assert_no_event_precedes_order_placed.sql.
         data_tests: [not_null]
       - name: ts_is_derived
         description: True where the source carries no timestamp for this event and one was borrowed. Always excludable in a single predicate.
@@ -113,7 +130,7 @@ models:
     data_tests:
       - unique_combination_of_columns:
           arguments:
-            combination_of_columns: [order_id, event_name]
+            combination_of_columns: [order_id, event_name, event_source_id]
       - expression_is_true:
           name: int_events_derived_ts_only_where_source_lacks_one
           arguments:

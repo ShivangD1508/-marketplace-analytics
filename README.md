@@ -54,8 +54,9 @@ model reads them through the `raw_data_dir` var.
 | Real dataset | `make download-data` | Kaggle API credentials in `~/.kaggle/kaggle.json` |
 | Generated | `make sample-data` | nothing |
 
-**The committed figures and row counts come from the generated dataset**, and the
-repository is honest about that rather than quietly implying otherwise. The Olist
+**The models are validated against the real Olist download**; the committed
+charts in ANALYSIS.md have not yet been regenerated from it, and the repository
+says so rather than quietly implying otherwise. The Olist
 data is not redistributable and Kaggle needs credentials, so
 [`scripts/generate_sample_data.py`](scripts/generate_sample_data.py) produces a
 seeded, deterministic dataset with the real one's exact schema — and, more to the
@@ -99,21 +100,29 @@ marketplace-analytics/
 
 # Event schema
 
-`int_events` is one row per `(order_id, event_name)`. Nine event types, 691,505
-rows over 100,000 orders.
+`int_events` is **one row per occurrence**. Nine event types, 690,828 rows over
+99,441 orders on the published Olist dataset.
+
+Occurrence, not `(order_id, event_name)` — a distinction the real data forced.
+547 orders carry more than one review, so that grain would have had to silently
+drop a buyer's second review to stay unique, and an event table whose key cannot
+represent something happening twice is not an event table. `event_source_id`
+carries whatever distinguishes repeat occurrences (`review_id` on the review
+events, null on the lifecycle events, which happen at most once per order) and
+is part of both the grain and `event_id`.
 
 ## The taxonomy
 
-| Event | Rank | Actor | Timestamp | Source |
-|---|---|---|---|---|
-| `order_placed` | 1 | buyer | `order_purchase_timestamp` | orders |
-| `payment_confirmed` | 2 | buyer | **derived** — borrowed from `order_approved_at` | payments |
-| `order_approved` | 3 | system | `order_approved_at` | orders |
-| `order_shipped` | 4 | seller | `order_delivered_carrier_date` | orders |
-| `order_delivered` | 5 | system | `order_delivered_customer_date` | orders |
-| `order_canceled` / `order_unavailable` | 5 | system | **derived** — last point the order was alive | orders |
-| `review_requested` | 6 | system | `review_creation_date` | reviews |
-| `review_submitted` | 7 | buyer | `review_answer_timestamp` | reviews |
+| Event | Rank | Actor | Timestamp | `event_source_id` | Source |
+|---|---|---|---|---|---|
+| `order_placed` | 1 | buyer | `order_purchase_timestamp` | — | orders |
+| `payment_confirmed` | 2 | buyer | **derived** — borrowed from `order_approved_at` | — | payments |
+| `order_approved` | 3 | system | `order_approved_at` | — | orders |
+| `order_shipped` | 4 | seller | `order_delivered_carrier_date` | — | orders |
+| `order_delivered` | 5 | system | `order_delivered_customer_date` | — | orders |
+| `order_canceled` / `order_unavailable` | 5 | system | **derived** — last point the order was alive | — | orders |
+| `review_requested` | 6 | system | `review_creation_date` | `review_id` | reviews |
+| `review_submitted` | 7 | buyer | `review_answer_timestamp` | `review_id` | reviews |
 
 ### Naming
 
@@ -187,26 +196,47 @@ phantom drop-off in the funnel.
 So `stg_orders` separates two ideas that a wide table conflates: `reached_approved`
 is a statement about status, `approved_at is not null` is a statement about
 observability. The event is emitted whenever the order *reached* the step, with a
-borrowed timestamp and `is_unobserved_step = true` when the time is unknown. In
-this dataset that is 1,977 approvals — 2% of the funnel's second step, which
-would otherwise look like a real leak.
+borrowed timestamp and `is_unobserved_step = true` when the time is unknown. On the real
+dataset that is 24 steps; on the generated one it is 1,977, deliberately
+exaggerated so the case is exercised at a visible scale.
 
 ### Out-of-order events
 
 Some events are stamped earlier than events that canonically precede them —
-review answers logged before the survey that prompted them, from source clock
-skew. The policy is: **retain the row with its raw timestamp, flag it, never
-silently reorder or drop it.** `is_out_of_order` marks 623 such events.
+review answers logged before the survey that prompted them, carrier handoffs
+recorded before the purchase. The policy is: **retain the row with its raw
+timestamp, flag it, never silently reorder or drop it.** `is_out_of_order` marks
+15,155 such events on the real dataset.
 
 Correspondingly, **event ordering is by `lifecycle_rank`, never by timestamp.**
 Two reasons. `payment_confirmed` and `order_approved` deliberately share a
 borrowed timestamp, so a timestamp sort would order them arbitrarily; and an
 out-of-order arrival must not be allowed to rewrite an order's funnel position.
 
-The one thing that is *not* tolerated is an event stamped before its order
-existed. That would make `hours_since_order_placed` negative and quietly corrupt
-every duration aggregate downstream, so it is a hard failure, asserted by
-[`assert_no_event_precedes_order_placed.sql`](dbt/tests/assert_no_event_precedes_order_placed.sql).
+This project originally asserted something stronger — that no event ever
+precedes its own order — and the real data proved it false. 166 orders are
+stamped as handed to the carrier *before* they were purchased, most by minutes
+but one by 171 days; 303 events in total precede their order.
+
+Clamping those timestamps would fabricate data and dropping the orders would
+lose real ones, so the sharper flag `is_before_order_placed` names the condition
+and `hours_since_order_placed` stays **signed** — negative, honestly, rather than
+clamped to a zero that would understate ship times while looking clean. Anything
+aggregating durations filters on that flag first.
+
+[`assert_no_event_precedes_order_placed.sql`](dbt/tests/assert_no_event_precedes_order_placed.sql)
+therefore asserts the claim that is actually defensible: **the source is allowed
+to be wrong; the model is not allowed to be wrong about the source.** It fails if
+an early event is unflagged, or if the flag and the signed offset drift apart.
+
+### Source defects, flagged not fixed
+
+`stg_orders` carries three flags for anomalies that are the source's, not the
+model's — `has_shipment_before_purchase` (166), `has_delivery_before_shipment`
+(23), `has_delivery_without_delivered_status` (6). The corresponding tests **warn
+at the known counts and error if the rate roughly doubles**, which keeps a build
+green on "Olist is still Olist" and turns it red on "something changed
+upstream". Failing rows are persisted to the `test_failures` schema either way.
 
 ### What is deliberately not an event
 

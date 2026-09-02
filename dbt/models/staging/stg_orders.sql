@@ -34,7 +34,24 @@ flagged as (
 
         approved_at  is null and order_status in ('approved', 'invoiced', 'processing', 'shipped', 'delivered') as has_unobserved_approval,
         shipped_at   is null and order_status in ('shipped', 'delivered')                                       as has_unobserved_shipment,
-        delivered_at is null and order_status = 'delivered'                                                     as has_unobserved_delivery
+        delivered_at is null and order_status = 'delivered'                                                     as has_unobserved_delivery,
+
+        -- SOURCE DEFECTS, not modelling choices. Olist's lifecycle timestamps
+        -- are not fully ordered, and pretending otherwise is how a pipeline
+        -- starts lying. On the published dataset (99,441 orders):
+        --   166 orders are stamped as handed to the carrier BEFORE they were
+        --       purchased -- mostly by minutes, but the worst by 171 days;
+        --    23 are stamped delivered before they shipped, by up to 16 days;
+        --     6 cancelled orders carry a delivery timestamp.
+        -- Each is flagged and carried through with its raw timestamp. Clamping
+        -- would fabricate data, and dropping would lose real orders; flagging
+        -- lets every downstream consumer decide, in one predicate, whether the
+        -- row belongs in its numerator.
+        -- coalesce, because a NULL timestamp makes the comparison NULL rather
+        -- than false, and a three-valued flag is a flag nobody can filter on.
+        coalesce(shipped_at < placed_at, false)                 as has_shipment_before_purchase,
+        coalesce(delivered_at < shipped_at, false)              as has_delivery_before_shipment,
+        coalesce(delivered_at is not null and order_status <> 'delivered', false) as has_delivery_without_delivered_status
     from renamed
 )
 

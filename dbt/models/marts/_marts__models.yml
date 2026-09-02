@@ -160,14 +160,20 @@ models:
               arguments:
                 condition: "is_reached"
       - name: hours_from_placed
-        data_tests:
-          - accepted_range:
-              arguments:
-                min_value: 0
+        description: >
+          Signed hours from purchase to this step. Negative only where the
+          source stamped the step before the purchase, in which case
+          is_before_order_placed is true.
+      - name: is_before_order_placed
+        data_tests: [not_null]
     data_tests:
       - unique_combination_of_columns:
           arguments:
             combination_of_columns: [order_id, step_number]
+      - expression_is_true:
+          name: fct_funnel_steps_negative_timing_is_flagged
+          arguments:
+            expression: "hours_from_placed is null or hours_from_placed >= 0 or is_before_order_placed"
       - expression_is_true:
           name: fct_funnel_steps_sequence_implies_reached
           arguments:

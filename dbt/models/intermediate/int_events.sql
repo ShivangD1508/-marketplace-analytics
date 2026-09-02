@@ -13,8 +13,16 @@
     The source is a set of wide lifecycle tables: one row per order carrying
     four timestamp columns, one row per review carrying two more, one row per
     payment carrying none. This model collapses all of that into one row per
-    (order, event), which is the shape every product-analytics question
-    actually wants.
+    OCCURRENCE, which is the shape every product-analytics question wants.
+
+    Occurrence, not (order, event). That distinction was forced by the real
+    data: 547 orders carry more than one review, so a grain of
+    (order_id, event_name) would have had to silently drop a buyer's second
+    review to stay unique. An event table whose key cannot represent something
+    happening twice is not an event table. `event_source_id` therefore carries
+    whatever distinguishes repeat occurrences -- review_id for the review
+    events, null for the lifecycle events, which genuinely happen at most once
+    per order -- and the surrogate key includes it.
 
     The design decisions are all documented in README.md under "Event schema".
     The short version, because the reasons matter more than the SQL:
@@ -66,7 +74,8 @@ with orders as (
         o.is_terminal_failure,
         o.has_unobserved_approval,
         o.has_unobserved_shipment,
-        o.has_unobserved_delivery
+        o.has_unobserved_delivery,
+        o.has_shipment_before_purchase
     from {{ ref('stg_orders') }} as o
     inner join {{ ref('stg_customers') }} as c
         on o.customer_id = c.customer_id
@@ -163,6 +172,7 @@ evt_order_placed as (
     select
         o.order_id,
         'order_placed'      as event_name,
+        cast(null as varchar) as event_source_id,
         1                   as lifecycle_rank,
         o.placed_at         as event_ts,
         false               as ts_is_derived,
@@ -196,6 +206,7 @@ evt_payment_confirmed as (
     select
         o.order_id,
         'payment_confirmed' as event_name,
+        cast(null as varchar) as event_source_id,
         2                   as lifecycle_rank,
         coalesce(o.approved_at, o.placed_at) as event_ts,
         true                as ts_is_derived,
@@ -220,6 +231,7 @@ evt_order_approved as (
     select
         o.order_id,
         'order_approved'    as event_name,
+        cast(null as varchar) as event_source_id,
         3                   as lifecycle_rank,
         coalesce(o.approved_at, o.placed_at) as event_ts,
         o.approved_at is null as ts_is_derived,
@@ -248,6 +260,7 @@ evt_order_shipped as (
     select
         o.order_id,
         'order_shipped'     as event_name,
+        cast(null as varchar) as event_source_id,
         4                   as lifecycle_rank,
         coalesce(o.shipped_at, o.approved_at, o.placed_at) as event_ts,
         o.shipped_at is null as ts_is_derived,
@@ -275,6 +288,7 @@ evt_order_delivered as (
     select
         o.order_id,
         'order_delivered'   as event_name,
+        cast(null as varchar) as event_source_id,
         5                   as lifecycle_rank,
         coalesce(o.delivered_at, o.shipped_at, o.placed_at) as event_ts,
         o.delivered_at is null as ts_is_derived,
@@ -317,6 +331,7 @@ evt_order_failed as (
             when 'canceled' then 'order_canceled'
             else 'order_unavailable'
         end                 as event_name,
+        cast(null as varchar) as event_source_id,
         -- Rank 5, alongside order_delivered rather than after everything: a
         -- terminal failure is the *alternative* to delivery, not a step past
         -- it. Ranking it last would flag almost every cancellation as
@@ -352,6 +367,7 @@ evt_review_requested as (
     select
         r.order_id,
         'review_requested'  as event_name,
+        r.review_id         as event_source_id,
         6                   as lifecycle_rank,
         r.survey_sent_at    as event_ts,
         false               as ts_is_derived,
@@ -368,6 +384,7 @@ evt_review_submitted as (
     select
         r.order_id,
         'review_submitted'  as event_name,
+        r.review_id         as event_source_id,
         7                   as lifecycle_rank,
         r.survey_answered_at as event_ts,
         false               as ts_is_derived,
@@ -422,22 +439,24 @@ sequenced as (
         -- timestamp, so a timestamp sort would order them arbitrarily; and an
         -- out-of-order arrival must not be allowed to rewrite the funnel.
         row_number() over (
-            partition by order_id order by lifecycle_rank, event_name
+            partition by order_id
+            order by lifecycle_rank, event_name, coalesce(event_source_id, '')
         ) as event_seq_in_order,
 
         -- True when this event is stamped earlier than something that
         -- canonically precedes it. Flagged, never corrected.
         event_ts < max(event_ts) over (
             partition by order_id
-            order by lifecycle_rank, event_name
+            order by lifecycle_rank, event_name, coalesce(event_source_id, '')
             rows between unbounded preceding and 1 preceding
         ) as is_out_of_order
     from with_order_context
 )
 
 select
-    {{ generate_surrogate_key(['order_id', 'event_name']) }} as event_id,
+    {{ generate_surrogate_key(['order_id', 'event_name', 'event_source_id']) }} as event_id,
     event_name,
+    event_source_id,
     event_ts,
     cast(event_ts as date)                as event_date,
     date_trunc('month', event_ts)         as event_month,
@@ -458,6 +477,19 @@ select
     ts_is_derived,
     is_unobserved_step,
     coalesce(is_out_of_order, false)      as is_out_of_order,
+
+    -- The sharp version of is_out_of_order: this event is stamped before the
+    -- order it belongs to existed. On the real dataset 166 order_shipped events
+    -- are, because the source says so. The raw timestamp is kept -- see
+    -- stg_orders -- and the anomaly is named here so that a consumer can
+    -- exclude it in one predicate rather than discovering it as a negative
+    -- number inside an average.
+    coalesce(event_ts < order_placed_at, false) as is_before_order_placed,
+
+    -- Signed, and therefore honest: negative for the events above. Anything
+    -- aggregating durations must filter on is_before_order_placed first; the
+    -- alternative is clamping to zero, which would silently understate ship
+    -- times rather than admit the source is wrong.
     round(date_diff('minute', order_placed_at, event_ts) / 60.0, 3) as hours_since_order_placed,
 
     cast(properties as varchar)           as properties,
