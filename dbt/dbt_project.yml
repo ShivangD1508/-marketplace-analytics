@@ -1,0 +1,51 @@
+name: marketplace_analytics
+version: "1.0.0"
+config-version: 2
+
+profile: marketplace_analytics
+
+model-paths: ["models"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+seed-paths: ["seeds"]
+snapshot-paths: ["snapshots"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+vars:
+  # Where the nine raw Olist CSVs live, relative to this dbt project directory.
+  # Point it at a real Kaggle download or at the output of
+  # scripts/generate_sample_data.py -- the models do not care which.
+  raw_data_dir: "../data/raw"
+
+  # Sessionization rule. A buyer-initiated event more than this many minutes
+  # after the previous one starts a new session. See README "Sessions".
+  session_inactivity_minutes: 30
+
+  # Incremental restatement window for int_events, in days, measured back from
+  # the newest order *placement*. Must exceed the longest placement-to-last-event
+  # span the marketplace produces, or late deliveries are silently dropped. On
+  # this data that span is 116 days at the maximum (44 at p99), so 120 clears it.
+  # See README "Incrementality" for the query that re-measures it.
+  events_lookback_days: 120
+
+models:
+  marketplace_analytics:
+    +materialized: view
+    staging:
+      +schema: staging
+      +materialized: view
+    intermediate:
+      +schema: intermediate
+      +materialized: table
+    marts:
+      +schema: marts
+      +materialized: table
+
+tests:
+  marketplace_analytics:
+    +store_failures: true
+    +schema: test_failures

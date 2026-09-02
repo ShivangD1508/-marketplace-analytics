@@ -1,0 +1,229 @@
+version: 2
+
+models:
+  - name: stg_orders
+    description: >
+      One row per order, with the four lifecycle timestamps typed and renamed,
+      and status-derived `reached_*` flags separated from timestamp presence.
+    columns:
+      - name: order_id
+        description: Primary key.
+        data_tests: [unique, not_null]
+      - name: customer_id
+        description: Order-scoped customer handle. Unique here because Olist mints one per order.
+        data_tests:
+          - unique
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_customers')
+                field: customer_id
+      - name: order_status
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [created, approved, invoiced, processing, shipped, delivered, canceled, unavailable]
+      - name: placed_at
+        description: Purchase time. Never null in the source, and the anchor for every other event.
+        data_tests: [not_null]
+      - name: approved_at
+        description: Null both for orders that never reached approval and for the ~2% whose approval time was not recorded.
+      - name: shipped_at
+        description: Handoff to carrier.
+      - name: delivered_at
+        description: Delivery to customer. Required whenever status = delivered, modulo unobserved rows.
+      - name: estimated_delivery_at
+        description: The promise made to the buyer at purchase time.
+        data_tests: [not_null]
+      - name: reached_delivered
+        data_tests: [not_null]
+    data_tests:
+      - expression_is_true:
+          name: stg_orders_approved_not_before_placed
+          arguments:
+            expression: "approved_at is null or approved_at >= placed_at"
+      - expression_is_true:
+          name: stg_orders_shipped_not_before_placed
+          arguments:
+            expression: "shipped_at is null or shipped_at >= placed_at"
+      - expression_is_true:
+          name: stg_orders_delivered_not_before_shipped
+          arguments:
+            expression: "delivered_at is null or shipped_at is null or delivered_at >= shipped_at"
+      - expression_is_true:
+          name: stg_orders_delivered_timestamp_only_when_delivered
+          arguments:
+            expression: "delivered_at is null or order_status = 'delivered'"
+
+  - name: stg_customers
+    description: One row per order-side customer record; carries the person-level customer_unique_id.
+    columns:
+      - name: customer_id
+        data_tests: [unique, not_null]
+      - name: customer_unique_id
+        description: Person-level identity used as the buyer actor_id throughout the event layer.
+        data_tests: [not_null]
+      - name: customer_zip_code_prefix
+        data_tests: [not_null]
+      - name: customer_state
+        data_tests: [not_null]
+      - name: customer_region
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [North, Northeast, Central-West, Southeast, South, Unknown]
+
+  - name: stg_sellers
+    columns:
+      - name: seller_id
+        data_tests: [unique, not_null]
+      - name: seller_state
+        data_tests: [not_null]
+      - name: seller_region
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [North, Northeast, Central-West, Southeast, South, Unknown]
+
+  - name: stg_order_items
+    description: One row per item line within an order.
+    columns:
+      - name: order_item_key
+        description: Surrogate key on (order_id, order_item_seq).
+        data_tests: [unique, not_null]
+      - name: order_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_orders')
+                field: order_id
+      - name: product_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_products')
+                field: product_id
+      - name: seller_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_sellers')
+                field: seller_id
+      - name: item_price
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 0
+      - name: item_freight_value
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 0
+
+  - name: stg_order_payments
+    description: One row per payment instrument on an order. No timestamp exists in the source.
+    columns:
+      - name: order_payment_key
+        data_tests: [unique, not_null]
+      - name: order_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_orders')
+                field: order_id
+      - name: payment_type
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [credit_card, boleto, voucher, debit_card, not_defined]
+      - name: payment_installments
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 24
+      - name: payment_value
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 0
+
+  - name: stg_order_reviews
+    description: Survey sent / survey answered, plus a flag for source clock skew between the two.
+    columns:
+      - name: review_id
+        data_tests: [not_null]
+      - name: order_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_orders')
+                field: order_id
+      - name: review_score
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 1
+                max_value: 5
+      - name: survey_sent_at
+        data_tests: [not_null]
+      - name: survey_answered_at
+        data_tests: [not_null]
+    data_tests:
+      - unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [order_id, review_id]
+
+  - name: stg_products
+    columns:
+      - name: product_id
+        data_tests: [unique, not_null]
+      - name: product_category
+        description: English category name; uncategorized products are labelled, not dropped.
+        data_tests: [not_null]
+      - name: product_weight_g
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+
+  - name: stg_product_category_translation
+    columns:
+      - name: product_category_name_pt
+        data_tests: [unique, not_null]
+      - name: product_category_name_en
+        data_tests: [unique, not_null]
+
+  - name: stg_geolocation
+    description: One centroid per zip prefix, so downstream geo joins are 1:1.
+    columns:
+      - name: zip_code_prefix
+        data_tests: [unique, not_null]
+      - name: latitude
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: -34.0
+                max_value: 5.5
+      - name: longitude
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: -74.0
+                max_value: -34.0
+      - name: region
+        data_tests: [not_null]

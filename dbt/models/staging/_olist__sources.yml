@@ -1,0 +1,104 @@
+version: 2
+
+sources:
+  - name: olist
+    description: >
+      Raw Olist Brazilian E-Commerce CSVs, read straight off disk by DuckDB.
+      Nothing is loaded or copied first: `external_location` points each source
+      table at its CSV, so the raw layer is genuinely immutable and the project
+      has no ingestion step to keep in sync.
+
+      Populate the directory either with the real Kaggle download
+      (`make download-data`, needs Kaggle credentials) or with the schema-identical
+      generator (`make sample-data`). The models are indifferent to which.
+    meta:
+      external_location: "read_csv('{{ var('raw_data_dir') }}/{name}.csv', header = true, sample_size = -1, nullstr = '')"
+
+    tables:
+      - name: olist_orders_dataset
+        description: One row per order. The lifecycle timestamps here are the spine of the whole event layer.
+        columns:
+          - name: order_id
+            description: Primary key.
+            data_tests: [unique, not_null]
+          - name: customer_id
+            description: >
+              Order-scoped customer key. NOT a person -- Olist mints a new
+              customer_id per order. Person-level identity is customer_unique_id
+              in olist_customers_dataset.
+            data_tests: [unique, not_null]
+          - name: order_status
+            data_tests:
+              - not_null
+              - accepted_values:
+                  arguments:
+                    values: [created, approved, invoiced, processing, shipped, delivered, canceled, unavailable]
+          - name: order_purchase_timestamp
+            description: The only lifecycle timestamp that is never null.
+            data_tests: [not_null]
+
+      - name: olist_customers_dataset
+        description: One row per order-side customer record, i.e. per order.
+        columns:
+          - name: customer_id
+            data_tests: [unique, not_null]
+          - name: customer_unique_id
+            description: Stable person-level key. Many customer_ids map to one of these.
+            data_tests: [not_null]
+
+      - name: olist_order_items_dataset
+        description: One row per item line within an order.
+        columns:
+          - name: order_id
+            data_tests: [not_null]
+          - name: order_item_id
+            description: Sequence number within the order, not a global key.
+            data_tests: [not_null]
+
+      - name: olist_order_payments_dataset
+        description: One row per payment instrument used on an order.
+        columns:
+          - name: order_id
+            data_tests: [not_null]
+          - name: payment_type
+            data_tests:
+              - accepted_values:
+                  arguments:
+                    values: [credit_card, boleto, voucher, debit_card, not_defined]
+
+      - name: olist_order_reviews_dataset
+        description: Post-purchase satisfaction survey, one row per review.
+        columns:
+          - name: review_id
+            data_tests: [not_null]
+          - name: order_id
+            data_tests: [not_null]
+          - name: review_score
+            data_tests:
+              - not_null
+              - accepted_values:
+                  arguments:
+                    values: [1, 2, 3, 4, 5]
+                    quote: false
+
+      - name: olist_products_dataset
+        columns:
+          - name: product_id
+            data_tests: [unique, not_null]
+
+      - name: olist_sellers_dataset
+        columns:
+          - name: seller_id
+            data_tests: [unique, not_null]
+
+      - name: olist_geolocation_dataset
+        description: Many lat/lng observations per zip prefix; deliberately not unique.
+        columns:
+          - name: geolocation_zip_code_prefix
+            data_tests: [not_null]
+
+      - name: product_category_name_translation
+        description: Portuguese to English category names.
+        columns:
+          - name: product_category_name
+            data_tests: [unique, not_null]

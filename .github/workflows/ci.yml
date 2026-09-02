@@ -1,0 +1,50 @@
+name: dbt build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # The raw CSVs are not committed. CI regenerates them from the seeded
+      # generator, which produces byte-identical output on every run, so a red
+      # build is always a real regression and never a data diff.
+      - name: Generate the dataset
+        run: python scripts/generate_sample_data.py --orders 100000 --out data/raw
+
+      - name: dbt build
+        working-directory: dbt
+        run: dbt build --profiles-dir . --target ci
+
+      # The whole point of an incremental model is behaviour a normal build
+      # cannot exercise: late-arriving rows, and agreement with a full refresh.
+      - name: Verify int_events incrementality
+        run: python scripts/verify_incremental.py
+
+      - name: Upload test failures on red
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbt-run-results
+          path: |
+            dbt/target/run_results.json
+            dbt/logs/
+          retention-days: 7

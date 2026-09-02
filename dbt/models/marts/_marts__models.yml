@@ -1,0 +1,298 @@
+version: 2
+
+models:
+  - name: fct_orders
+    description: >
+      One row per order: lifecycle timestamps, durations between them, basket
+      and payment rollups, the final review, and buyer/seller geography.
+      Built from staging rather than from int_events so that order *state* does
+      not depend on the event taxonomy staying frozen.
+    columns:
+      - name: order_id
+        data_tests: [unique, not_null]
+      - name: customer_id
+        data_tests: [unique, not_null]
+      - name: customer_unique_id
+        description: Person-level buyer key, the join to dim_customers.
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_customers')
+                field: customer_unique_id
+      - name: order_status
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [created, approved, invoiced, processing, shipped, delivered, canceled, unavailable]
+      - name: placed_at
+        data_tests: [not_null]
+      - name: placed_month
+        data_tests: [not_null]
+      - name: delivered_at
+        description: Populated only for delivered orders, and not for the small share whose delivery time was never recorded.
+        data_tests:
+          - not_null_where:
+              arguments:
+                condition: "reached_delivered and not has_unobserved_delivery"
+      - name: days_to_delivery
+        description: Purchase to delivery, in days. Null when the order was not delivered.
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 400
+      - name: days_in_transit
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 400
+      - name: promised_lead_days
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 0
+      - name: order_value
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 0
+      - name: freight_ratio
+        description: Freight as a share of item value. Null on zero-value orders rather than divided by zero.
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+      - name: item_count
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 0
+      - name: buyer_region
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [North, Northeast, Central-West, Southeast, South, Unknown]
+      - name: shipping_lane
+        description: Buyer/seller geographic relationship, the strongest single predictor of delivery time here.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [intra_state, intra_region, inter_region, multi_seller]
+      - name: review_score
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 1
+                max_value: 5
+      - name: primary_payment_type
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [credit_card, boleto, voucher, debit_card, not_defined]
+    data_tests:
+      - expression_is_true:
+          name: fct_orders_delivery_after_shipment
+          arguments:
+            expression: "delivered_at is null or shipped_at is null or delivered_at >= shipped_at"
+      - expression_is_true:
+          name: fct_orders_value_reconciles_to_line_items
+          arguments:
+            expression: "abs(order_value - (items_value + freight_value)) < 0.01"
+      - expression_is_true:
+          name: fct_orders_delivered_implies_status
+          arguments:
+            expression: "not reached_delivered or order_status = 'delivered'"
+
+  - name: fct_funnel_steps
+    description: >
+      One row per order per funnel step, whether or not the step was reached.
+      Carries both `is_reached` (the event fired) and `is_reached_in_sequence`
+      (it fired and so did every prior step). Funnel arithmetic uses the latter;
+      the gap between them is the population reviewed without being delivered.
+    columns:
+      - name: funnel_step_key
+        data_tests: [unique, not_null]
+      - name: order_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('fct_orders')
+                field: order_id
+      - name: step_number
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 1
+                max_value: 5
+      - name: step_name
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [placed, approved, shipped, delivered, reviewed]
+      - name: is_reached
+        data_tests: [not_null]
+      - name: is_reached_in_sequence
+        data_tests: [not_null]
+      - name: is_drop_off_step
+        data_tests: [not_null]
+      - name: furthest_step_reached
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 1
+                max_value: 5
+      - name: reached_at
+        description: Null exactly when the step was not reached.
+        data_tests:
+          - not_null_where:
+              arguments:
+                condition: "is_reached"
+      - name: hours_from_placed
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+    data_tests:
+      - unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [order_id, step_number]
+      - expression_is_true:
+          name: fct_funnel_steps_sequence_implies_reached
+          arguments:
+            expression: "not is_reached_in_sequence or is_reached"
+      - expression_is_true:
+          name: fct_funnel_steps_unreached_has_no_timestamp
+          arguments:
+            expression: "is_reached or reached_at is null"
+      - expression_is_true:
+          name: fct_funnel_steps_step_one_always_reached
+          arguments:
+            expression: "step_number <> 1 or is_reached_in_sequence"
+
+  - name: dim_customers
+    description: >
+      One row per buyer, keyed on customer_unique_id (the person), not
+      customer_id (the checkout). Carries acquisition cohort, current
+      geography, lifetime value, repeat behaviour and satisfaction.
+    columns:
+      - name: customer_unique_id
+        data_tests: [unique, not_null]
+      - name: cohort_month
+        description: Month of the buyer's first order; the grain of agg_cohort_retention.
+        data_tests: [not_null]
+      - name: first_order_at
+        data_tests: [not_null]
+      - name: last_order_at
+        data_tests: [not_null]
+      - name: orders_placed
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 1
+      - name: lifetime_value
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 0
+      - name: buyer_segment
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [one_time, occasional, frequent]
+      - name: acquisition_region
+        data_tests: [not_null]
+      - name: current_region
+        data_tests: [not_null]
+      - name: avg_review_score
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 1
+                max_value: 5
+      - name: session_count
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 1
+    data_tests:
+      - expression_is_true:
+          name: dim_customers_last_order_not_before_first
+          arguments:
+            expression: "last_order_at >= first_order_at"
+      - expression_is_true:
+          name: dim_customers_segment_matches_order_count
+          arguments:
+            expression: >
+              (buyer_segment = 'one_time' and orders_placed = 1)
+              or (buyer_segment = 'occasional' and orders_placed between 2 and 3)
+              or (buyer_segment = 'frequent' and orders_placed > 3)
+      - expression_is_true:
+          name: dim_customers_delivered_within_placed
+          arguments:
+            expression: "orders_delivered <= orders_placed"
+
+  - name: agg_cohort_retention
+    description: >
+      One row per (acquisition cohort month, months since first order), over a
+      fully materialised grid including zero-retention periods. `is_fully_observed`
+      marks offsets that had a complete month of observation window.
+    columns:
+      - name: cohort_period_key
+        data_tests: [unique, not_null]
+      - name: cohort_month
+        data_tests: [not_null]
+      - name: months_since_first_order
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 0
+      - name: cohort_size
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 1
+      - name: active_buyers
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 0
+      - name: retention_rate
+        data_tests:
+          - not_null
+          - accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+      - name: is_fully_observed
+        data_tests: [not_null]
+    data_tests:
+      - unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [cohort_month, months_since_first_order]
+      - expression_is_true:
+          name: agg_cohort_retention_month_zero_is_full
+          arguments:
+            expression: "months_since_first_order <> 0 or active_buyers = cohort_size"
+      - expression_is_true:
+          name: agg_cohort_retention_active_within_cohort
+          arguments:
+            expression: "active_buyers <= cohort_size"

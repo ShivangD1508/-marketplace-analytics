@@ -1,0 +1,21 @@
+# Checked in on purpose: DuckDB is file-based, so there are no credentials here
+# and a fresh clone can run `dbt build` with no setup. No extensions are
+# declared -- everything this project needs (CSV reader, JSON) is in the DuckDB
+# core, so `dbt build` works with no network access at all.
+marketplace_analytics:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: "../data/marketplace.duckdb"
+      threads: 8
+    ci:
+      type: duckdb
+      path: "../data/marketplace_ci.duckdb"
+      threads: 4
+    incremental_test:
+      # Used only by scripts/verify_incremental.py, which needs a throwaway
+      # database so the check never touches the dev one.
+      type: duckdb
+      path: "../data/marketplace_inc_test.duckdb"
+      threads: 4

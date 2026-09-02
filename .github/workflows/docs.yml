@@ -1,0 +1,72 @@
+name: dbt docs
+
+# Publishes the dbt documentation site -- model and column descriptions, tests,
+# compiled SQL and the clickable lineage graph -- to GitHub Pages.
+#
+# One-time setup in the repository: Settings -> Pages -> Source: "GitHub Actions".
+
+on:
+  push:
+    branches: [main, claude/marketplace-event-layer-oca24c]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate the dataset
+        run: python scripts/generate_sample_data.py --orders 100000 --out data/raw
+
+      # `docs generate` needs a populated warehouse: the catalog is built by
+      # introspecting the real relations, which is what gives the docs site
+      # column types and row counts rather than just the YAML.
+      - name: Build models
+        working-directory: dbt
+        run: dbt build --profiles-dir . --target ci
+
+      - name: Generate docs
+        working-directory: dbt
+        run: dbt docs generate --profiles-dir . --target ci --static
+
+      # --static emits one self-contained HTML file with the manifest and
+      # catalog inlined. Serving that as index.html avoids the CORS problems
+      # the multi-file docs site hits on Pages.
+      - name: Assemble the site
+        run: |
+          mkdir -p site
+          cp dbt/target/static_index.html site/index.html
+          cp dbt/target/manifest.json dbt/target/catalog.json site/
+          touch site/.nojekyll
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

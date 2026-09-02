@@ -1,0 +1,5 @@
+# Orchestration only. `dbt build` does not need any of this -- keep it out of
+# the main requirements so CI installs a small dependency set.
+dagster~=1.9
+dagster-dbt~=0.25
+dagster-webserver~=1.9
