@@ -73,13 +73,22 @@ orders as (
 ),
 
 events as (
+    -- Collapsed to one row per (order, event_name), because a funnel step is
+    -- "did this order get here, and when first", not "how many times". 547
+    -- orders have more than one review, and joining the raw event stream would
+    -- fan those orders out into duplicate funnel rows and break the grain.
+    -- The earliest occurrence is the one that matters: reaching a step is a
+    -- transition, and the transition happened the first time.
     select
         order_id,
         event_name,
-        event_ts,
-        ts_is_derived,
-        is_unobserved_step
+        min(event_ts)                                  as event_ts,
+        bool_or(ts_is_derived)                         as ts_is_derived,
+        bool_or(is_unobserved_step)                    as is_unobserved_step,
+        bool_or(is_before_order_placed)                as is_before_order_placed,
+        count(*)                                       as occurrence_count
     from {{ ref('int_events') }}
+    group by order_id, event_name
 ),
 
 grid as (
@@ -98,7 +107,9 @@ joined as (
         e.event_ts,
         e.event_ts is not null                as is_reached,
         coalesce(e.ts_is_derived, false)      as ts_is_derived,
-        coalesce(e.is_unobserved_step, false) as is_unobserved_step
+        coalesce(e.is_unobserved_step, false) as is_unobserved_step,
+        coalesce(e.is_before_order_placed, false) as is_before_order_placed,
+        coalesce(e.occurrence_count, 0)       as occurrence_count
     from grid as g
     left join events as e
         on g.order_id = e.order_id
@@ -154,9 +165,14 @@ select
     round(date_diff('minute', prev_step_ts, event_ts) / 60.0, 3)   as hours_from_prev_step,
 
     -- Provenance travels with the step so timing analysis can drop borrowed
-    -- timestamps without re-deriving which ones they are.
+    -- timestamps without re-deriving which ones they are. is_before_order_placed
+    -- marks the steps whose hours_from_placed is negative because the source
+    -- stamped them before the purchase; any timing aggregate must exclude them.
     ts_is_derived,
     is_unobserved_step,
+    is_before_order_placed,
+    -- How many times this event fired for the order. >1 only for reviews.
+    occurrence_count,
 
     -- Slicing dimensions, denormalised on purpose: a funnel is only ever read
     -- with a group-by attached.

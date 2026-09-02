@@ -38,23 +38,58 @@ models:
         data_tests: [not_null]
       - name: reached_delivered
         data_tests: [not_null]
+      - name: has_shipment_before_purchase
+        description: >
+          Source defect: the carrier handoff is stamped before the purchase.
+          166 orders in the published dataset. Carried with its raw timestamp
+          and flagged, never clamped.
+        data_tests: [not_null]
+      - name: has_delivery_before_shipment
+        description: "Source defect: delivered before shipped. 23 orders."
+        data_tests: [not_null]
+      - name: has_delivery_without_delivered_status
+        description: "Source defect: a cancelled order carrying a delivery timestamp. 6 orders."
+        data_tests: [not_null]
     data_tests:
+      # This one is a genuine invariant and stays an error: no order in the
+      # published dataset is approved before it is placed, and if that ever
+      # changes the payment-timestamp logic in int_events is wrong.
       - expression_is_true:
           name: stg_orders_approved_not_before_placed
           arguments:
             expression: "approved_at is null or approved_at >= placed_at"
+
+      # The next three describe SOURCE QUALITY, which this project does not
+      # control, so they warn rather than fail -- but with an error threshold,
+      # which is the point. The counts below are the known state of the
+      # published Olist dataset. A build stays green at that level and turns
+      # red if the anomaly rate roughly doubles, which is the signal that
+      # something changed upstream rather than that Olist is still Olist.
+      # Failing rows are persisted to the test_failures schema either way.
       - expression_is_true:
           name: stg_orders_shipped_not_before_placed
           arguments:
             expression: "shipped_at is null or shipped_at >= placed_at"
+          config:
+            severity: warn
+            warn_if: ">0"
+            error_if: ">350"        # known: 166
       - expression_is_true:
           name: stg_orders_delivered_not_before_shipped
           arguments:
             expression: "delivered_at is null or shipped_at is null or delivered_at >= shipped_at"
+          config:
+            severity: warn
+            warn_if: ">0"
+            error_if: ">50"         # known: 23
       - expression_is_true:
           name: stg_orders_delivered_timestamp_only_when_delivered
           arguments:
             expression: "delivered_at is null or order_status = 'delivered'"
+          config:
+            severity: warn
+            warn_if: ">0"
+            error_if: ">20"         # known: 6
 
   - name: stg_customers
     description: One row per order-side customer record; carries the person-level customer_unique_id.
