@@ -20,7 +20,7 @@ and is written down below rather than left implicit in SQL.
   delivery time by region.
 
 ```
-15 models · 228 tests · 691,505 events · dbt build passes clean in ~25s
+15 models · 247 tests · 690,828 events from 99,441 real orders · dbt build passes clean in ~25s
 ```
 
 ---
@@ -30,7 +30,7 @@ and is written down below rather than left implicit in SQL.
 ```bash
 make setup         # install dependencies
 make sample-data   # write the nine raw CSVs (6 seconds, deterministic)
-make build         # dbt build: 15 models, 228 tests
+make build         # dbt build: 15 models, 247 tests
 make verify        # prove int_events handles late-arriving data
 make charts        # regenerate the three figures in ANALYSIS.md
 make docs          # build the documentation site locally
@@ -66,8 +66,10 @@ approval time was never recorded, ~2% of products with no category, orders
 settled across two payment instruments, reviews stamped before the survey that
 prompted them, and a repeat-purchase rate near 3%. Those are the cases the event
 layer has to have an opinion about; a clean synthetic dataset would let every
-hard decision below go unmade. Point `raw_data_dir` at a real download and
-`make build` runs unchanged.
+hard decision below go unmade — and running against the real download proved the
+point, since it broke four assumptions the generated data was too clean to
+surface (see *What the real data changed*, below). Point `raw_data_dir` at either
+one and `make build` runs unchanged.
 
 ## Layout
 
@@ -290,7 +292,7 @@ and selects orders by when they were **placed**:
 
 ```sql
 where o.placed_at >= (
-    select max(order_placed_at) - interval '120' day from {{ this }}
+    select max(order_placed_at) - interval '270' day from {{ this }}
 )
 ```
 
@@ -304,10 +306,31 @@ in the future relative to everything still changing, and skips precisely the
 late-arriving deliveries the window exists to catch. The model builds, every test
 passes, and the funnel under-reports delivery forever.
 
-Sizing the window is an empirical question, not a taste one. Measured on this
-data, placement-to-last-event is 11 days at p50, 44 at p99, 66 at p99.9 and 116
-at the maximum — so the 120-day default clears the observed worst case. Re-measure
-before trusting it elsewhere:
+### Sizing it is a trade-off with no free answer
+
+Measured on the real dataset, placement-to-last-event is 13 days at p50, 56 at
+p99, 185 at p99.9 — and **528 at the maximum**. That long tail means correctness
+and cost trade off directly:
+
+| Window | Orders whose lifecycle outruns it | Share of table reprocessed |
+|---|---|---|
+| 90d | 338 (0.34%) | 9.6% |
+| 190d | 89 (0.09%) | 30.8% |
+| **270d** | **33 (0.03%)** | **49.7%** |
+| 550d | 0 (0.00%) | **93.3%** |
+
+A window wide enough to be strictly correct reprocesses 93% of the table, at
+which point the model is incremental in name only. So the default is **270 days**,
+and the remaining 33 orders are swept up by the **weekly full refresh** the
+Dagster DAG schedules — that job is load-bearing, not hygiene.
+
+The real fix is a source-side `updated_at` column, which Olist does not have.
+With one, the window collapses to "rows changed since the last run" and the
+trade-off disappears entirely. Absent that, a time-windowed strategy can be cheap
+or exhaustive but not both, and the gap has to be closed by something else rather
+than wished away.
+
+Re-measure before trusting these numbers elsewhere:
 
 ```sql
 select quantile_cont(span, [0.5, 0.99, 0.999]) , max(span) from (
@@ -331,25 +354,43 @@ t2  assert: the deliveries appeared, no duplicate event_ids, restated orders
 ```
 
 ```
-  holding back 8,834 deliveries later than 2018-09-17
-  [1] late-arriving deliveries captured: +8,834 (expected +8,834)
+  restatement window: 270 days back from 2018-10-17
+  of 11 held-back deliveries, 11 are in-window and 0 predate it
+  [1] in-window late deliveries captured: +11 (expected +11)
   [2] duplicate event_ids after incremental run: 0
-  [3] restated orders present in output: 8,834
-  [4] incremental rows 691,505 vs full-refresh rows 691,505
-       every column matches row for row
+  [3] restated orders present in output: 11
+  [4] incremental rows 690,828 vs full-refresh rows 690,828
+       all 690,828 shared rows match column for column
   PASSED
 ```
 
-This script earned its place: it is what caught the `max(event_ts)` watermark bug
-described above, which passed all 228 dbt tests.
+Note what it does **not** assert: that no event is ever missed. It cannot,
+because the model no longer claims it. The contract it checks is the one actually
+on offer — every order *inside* the window is captured exactly, and any
+divergence from a full refresh consists only of orders outside it. A test that
+asserted more than the design promises would either fail forever or force the
+window wider than is useful.
+
+This script has earned its place twice. It caught the `max(event_ts)` watermark
+bug described above, which passed all 228 dbt tests — and then, on the real data,
+it failed again and forced the window from 120 days to 270.
 
 ---
 
 # Testing
 
-228 tests: 224 schema tests across all 15 models, and 4 singular tests. Failures
-are persisted (`store_failures: true`) into a `test_failures` schema so a red
-build can be inspected rather than re-run.
+247 tests across all 15 models, plus 4 singular tests. Failures are persisted
+(`store_failures: true`) into a `test_failures` schema so a red build can be
+inspected rather than re-run.
+
+**Three tests warn rather than fail, on purpose.** Shipped-before-purchase (166
+orders), delivered-before-shipped (23) and cancelled-with-a-delivery-time (6)
+describe *source quality*, which this project does not control. They warn at the
+known counts and **error if the rate roughly doubles** — so the build stays green
+on "Olist is still Olist" and turns red on "something changed upstream". That
+distinction is the whole point: how much bad data arrived is a question about the
+source, whereas whether the model described it correctly is a question about this
+repository, and only the second one is a bug here.
 
 Schema tests cover the usual keys, nullability, accepted values and referential
 integrity, plus grain assertions (`unique_combination_of_columns`) on every model
@@ -359,7 +400,7 @@ The four singular tests each guard something no generic test can express:
 
 | Test | What it guards |
 |---|---|
-| [`assert_no_event_precedes_order_placed`](dbt/tests/assert_no_event_precedes_order_placed.sql) | The event layer's load-bearing invariant: every event is measured from its order's placement, so a negative offset would corrupt every duration downstream. Relational — compares a row against a *different* row's timestamp. |
+| [`assert_no_event_precedes_order_placed`](dbt/tests/assert_no_event_precedes_order_placed.sql) | That anomalies are *labelled*. 166 real orders ship before they are purchased, so the stronger invariant is false; this asserts the flag tracks the condition and the signed offset agrees with it. Relational — compares a row against a *different* row's timestamp. |
 | [`assert_funnel_steps_monotonic`](dbt/tests/assert_funnel_steps_monotonic.sql) | A funnel must not widen as it descends. Monotonicity is structural in `fct_funnel_steps`, but "structural" is a claim about a window frame; change the partition and the guarantee vanishes while every row count still looks plausible. |
 | [`assert_events_reconcile_to_source_rows`](dbt/tests/assert_events_reconcile_to_source_rows.sql) | Nine union'd CTEs each with their own `WHERE`. A wrong predicate in one loses events silently — the model builds, uniqueness passes, the funnel just reports a smaller number. Nine row-count identities against the raw tables. |
 | [`assert_sessions_partition_buyer_events`](dbt/tests/assert_sessions_partition_buyer_events.sql) | Gap-based sessionization is three stacked window functions; a mismatched `ORDER BY` between them double-counts events at boundaries without breaking uniqueness on `session_id`. Reconciles event totals and buyer sets in both directions. |
@@ -396,13 +437,16 @@ data and runs all 243 dbt nodes green.
 
 # Notes and limitations
 
-- **The published figures are from generated data.** Schema-identical to the
-  real dataset and built to reproduce its awkward cases, but the marketplace
-  dynamics are modelled, not measured. Swap in the Kaggle download and every
-  command works unchanged; the numbers in ANALYSIS.md will move.
-- **The generated geolocation table is smaller than the real one** (158K rows vs
-  ~1M). `stg_geolocation` collapses it to one centroid per zip prefix either way,
-  so nothing downstream changes.
+- **The geolocation source is pre-aggregated to one centroid per zip prefix**
+  (19K rows rather than the raw ~1M). `stg_geolocation` performs exactly that
+  collapse anyway, so every downstream number is identical; only the raw-row
+  count differs.
+- **The event layer is only as ordered as its source.** 15,155 events (2.2%) are
+  flagged out-of-order and 303 precede their own order. They are carried, not
+  corrected — any aggregate over durations must filter on
+  `is_before_order_placed` first. That is a contract, and contracts get missed.
+- **Incrementality is a documented approximation**, not a guarantee. See above:
+  0.03% of orders outrun the window and rely on the weekly full refresh.
 - **Sessions are thin by construction.** With ~1.03 orders per buyer there is
   little to sessionize. The rules are written for a stream that also carries
   clickstream events, which is the point of matching the 30-minute convention.
@@ -412,3 +456,31 @@ data and runs all 243 dbt nodes green.
   depend on the event taxonomy staying frozen.
 - **No fourth mart.** A category-mix or seller-performance mart would be easy and
   would answer nothing that was asked.
+
+---
+
+# What the real data changed
+
+The project was built against a schema-identical generated dataset, then run
+against the real Kaggle download. Four assumptions broke — each is worth more
+than the code that fixed it:
+
+1. **166 orders ship before they are purchased** (one by 171 days), 23 are
+   delivered before they ship, and 6 cancelled orders carry a delivery time. The
+   "no event precedes its order" invariant was true only of clean data.
+2. **547 orders carry more than one review**, which broke the event grain
+   outright. A key of `(order_id, event_name)` would have had to drop a buyer's
+   second review to stay unique.
+3. **The incremental window was 2.3× too small.** Real lifecycles run to 528 days
+   against the generated 116, and `verify_incremental.py` failed until the window
+   moved from 120 days to 270 — surfacing that full correctness would cost 93% of
+   the table.
+4. **Two analytical conclusions were wrong.** Retention is not flat, it decays
+   threefold; and the least *reliable* region is the Northeast, not the slowest
+   one. Both are recorded in [ANALYSIS.md](ANALYSIS.md#a-note-on-what-changed-when-the-real-data-arrived)
+   rather than quietly corrected.
+
+Synthetic data reproduces the structure you thought to model. It cannot reproduce
+the findings you did not — which is the argument for running against real data
+before believing anything, and for building the flagging machinery that made
+absorbing all four a matter of hours rather than a rewrite.

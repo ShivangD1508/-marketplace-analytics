@@ -44,11 +44,22 @@ models:
                 min_value: 0
                 max_value: 400
       - name: days_in_transit
+        description: >
+          Signed days from carrier handoff to delivery. Negative for the 23
+          orders the source stamps as delivered before they shipped; those carry
+          has_delivery_before_shipment. Clamping would invent transit times, so
+          the sign is preserved and the anomaly named.
         data_tests:
           - accepted_range:
               arguments:
-                min_value: 0
+                min_value: -30
                 max_value: 400
+      - name: has_delivery_before_shipment
+        description: "Source defect: delivered before shipped. 23 orders."
+        data_tests: [not_null]
+      - name: has_shipment_before_purchase
+        description: "Source defect: shipped before purchased. 166 orders."
+        data_tests: [not_null]
       - name: promised_lead_days
         data_tests:
           - not_null
@@ -98,10 +109,15 @@ models:
               arguments:
                 values: [credit_card, boleto, voucher, debit_card, not_defined]
     data_tests:
+      # Delivery must follow shipment unless the source says otherwise -- in
+      # which case the row must say so. Same policy as int_events: the source
+      # is allowed to be wrong, the model is not allowed to be wrong about it.
       - expression_is_true:
-          name: fct_orders_delivery_after_shipment
+          name: fct_orders_delivery_after_shipment_or_flagged
           arguments:
-            expression: "delivered_at is null or shipped_at is null or delivered_at >= shipped_at"
+            expression: >
+              delivered_at is null or shipped_at is null
+              or delivered_at >= shipped_at or has_delivery_before_shipment
       - expression_is_true:
           name: fct_orders_value_reconciles_to_line_items
           arguments:

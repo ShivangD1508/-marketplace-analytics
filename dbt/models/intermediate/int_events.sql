@@ -105,11 +105,20 @@ with orders as (
         marketplace produces. Reprocess every order placed inside that span and
         nothing that can still move is missed.
 
-        Sizing `events_lookback_days` is therefore an empirical question, not a
-        taste one. Measured on this data, the placement-to-last-event span is
-        11 days at p50, 44 at p99, 66 at p99.9 and 116 at the maximum -- so the
-        default of 120 days clears the observed worst case. Re-measure it before
-        trusting it on other data; the query is in README "Incrementality".
+        Sizing `events_lookback_days` is therefore an empirical question, and on
+        real data it is also a trade-off with no free answer. Measured on the
+        published dataset the placement-to-last-event span is 13 days at p50,
+        56 at p99, 185 at p99.9 -- and 528 at the maximum. A window wide enough
+        to be strictly correct (550 days) reprocesses 93% of the table, at
+        which point the model is incremental in name only.
+
+        So the window is set to 270 days, which leaves 33 orders (0.03%) whose
+        lifecycles outrun it, and those are swept up by the weekly full refresh
+        the Dagster DAG schedules. That is the honest shape of the problem: with
+        no source-side updated_at column, a time-windowed incremental strategy
+        can be cheap or exhaustive but not both, and the gap has to be closed by
+        something else rather than wished away. Re-measure before trusting these
+        numbers on other data; the query is in README "Incrementality".
 
         `delete+insert` on the deterministic event_id makes the rewrite
         idempotent, which is what scripts/verify_incremental.py checks by
