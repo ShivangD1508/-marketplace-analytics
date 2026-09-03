@@ -153,10 +153,14 @@ final as (
         r.review_score <= 2                 as is_detractor,
 
         -- Data-quality provenance, carried through from staging so a consumer
-        -- of this mart can reproduce the funnel's treatment of missing steps.
+        -- of this mart can reproduce the funnel's treatment of missing steps
+        -- and exclude the source's self-contradicting rows.
         o.has_unobserved_approval,
         o.has_unobserved_shipment,
-        o.has_unobserved_delivery
+        o.has_unobserved_delivery,
+        o.has_shipment_before_purchase,
+        o.has_delivery_before_shipment,
+        o.has_delivery_without_delivered_status
 
     from orders as o
     inner join customers as c on o.customer_id = c.customer_id

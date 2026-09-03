@@ -12,10 +12,12 @@ Three things here are deliberate rather than boilerplate:
     that fail and retry independently. Folding ingestion into the dbt run would
     make a Kaggle outage look like a broken model.
 
-  * int_events runs incrementally on the schedule and is never full-refreshed
-    automatically. A full refresh of the event table is a deliberate act -- see
-    README "Incrementality" -- so it is exposed as a separate job an operator
-    triggers, not as something a retry can trip into.
+  * int_events runs incrementally each day and is fully refreshed weekly. The
+    weekly job is load-bearing, not hygiene: the restatement window is sized to
+    a trade-off (270 days reprocesses half the table and still misses 0.03% of
+    orders), so the full refresh is what turns "approximately correct" into
+    "eventually correct". It stays a separate job so a retry of the daily run
+    can never trip into it by accident.
 
   * The schedule is daily rather than hourly. The upstream is a daily CSV drop;
     running more often would just re-read the same file and rewrite the same
@@ -194,9 +196,10 @@ full_refresh = define_asset_job(
         }
     },
     description=(
-        "Rebuild int_events from scratch. Manual only: a full refresh discards "
-        "the incremental history, so it is an operator decision -- run it after "
-        "changing the event taxonomy or the restatement window, not on a timer."
+        "Rebuild int_events from scratch. Runs weekly, and on demand. The weekly "
+        "run is not belt-and-braces: the 270-day restatement window leaves ~0.03% "
+        "of orders whose lifecycles outrun it, and a full refresh is the only "
+        "thing that sweeps those up. See README 'Incrementality'."
     ),
 )
 
@@ -207,10 +210,22 @@ daily_schedule = ScheduleDefinition(
     description="06:00 daily, after the upstream marketplace export lands.",
 )
 
+# The incremental window is a deliberate trade-off, not a guarantee: at 270 days
+# it reprocesses half the table and still leaves 33 orders (0.03%) whose
+# lifecycles run longer. This schedule is what makes the model eventually
+# correct rather than approximately correct, so it is part of the design and not
+# an optional extra. Sundays, when the daily job is least likely to overlap it.
+weekly_full_refresh_schedule = ScheduleDefinition(
+    job=full_refresh,
+    cron_schedule="0 3 * * 0",
+    default_status=DefaultScheduleStatus.STOPPED,
+    description="03:00 Sundays -- sweeps up orders whose lifecycles outran the restatement window.",
+)
+
 defs = Definitions(
     assets=[olist_raw_csv, marketplace_dbt_assets],
     jobs=[daily_refresh, full_refresh],
-    schedules=[daily_schedule],
+    schedules=[daily_schedule, weekly_full_refresh_schedule],
     resources={
         "dbt": DbtCliResource(
             project_dir=dbt_project,

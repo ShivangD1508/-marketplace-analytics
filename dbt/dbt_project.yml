@@ -26,11 +26,22 @@ vars:
   session_inactivity_minutes: 30
 
   # Incremental restatement window for int_events, in days, measured back from
-  # the newest order *placement*. Must exceed the longest placement-to-last-event
-  # span the marketplace produces, or late deliveries are silently dropped. On
-  # this data that span is 116 days at the maximum (44 at p99), so 120 clears it.
-  # See README "Incrementality" for the query that re-measures it.
-  events_lookback_days: 120
+  # the newest order *placement*. Sized empirically, and the sizing is a real
+  # trade-off rather than a safe default -- measured on the published dataset:
+  #
+  #   window   orders whose lifecycle exceeds it   share of table reprocessed
+  #     90d          338  (0.34%)                          9.6%
+  #    190d           89  (0.09%)                         30.8%
+  #    270d           33  (0.03%)                         49.7%
+  #    550d            0  (0.00%)                         93.3%
+  #
+  # Olist's event stream has a 528-day tail, so a window wide enough to be
+  # strictly correct reprocesses almost the whole table and incrementality buys
+  # nothing. 270 days is the chosen point: every order but 33 completes inside
+  # it, and those 33 are swept up by the weekly full refresh that the Dagster
+  # DAG schedules. See README "Incrementality" for the query that re-measures
+  # this and for why a source-side updated_at is the real fix.
+  events_lookback_days: 270
 
 models:
   marketplace_analytics:
