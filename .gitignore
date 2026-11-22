@@ -4,6 +4,10 @@ data/raw/
 data/*.duckdb
 data/*.duckdb.wal
 
+# Built documentation site, assembled by the docs workflow before it is
+# force-pushed to the gh-pages branch.
+site/
+
 # dbt build output
 dbt/target/
 dbt/dbt_packages/

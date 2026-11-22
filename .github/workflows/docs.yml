@@ -3,24 +3,33 @@ name: dbt docs
 # Publishes the dbt documentation site -- model and column descriptions, tests,
 # compiled SQL and the clickable lineage graph -- to GitHub Pages.
 #
-# One-time setup in the repository: Settings -> Pages -> Source: "GitHub Actions".
+# This workflow builds the site and force-pushes it to the `gh-pages` branch,
+# rather than using actions/deploy-pages. That is deliberate. The Pages
+# deployment action publishes through the protected `github-pages` environment,
+# whose deployment-branch rule is pinned to whatever the default branch was when
+# Pages was first enabled. This repository enabled Pages while a feature branch
+# was still the default, so every deploy from `main` was rejected before the job
+# even started -- two seconds, no runner, no logs. Pushing a branch needs only
+# `contents: write` and depends on no environment, so it cannot be broken again
+# by a setting that is invisible from the build.
+#
+# One-time setup in the repository: Settings -> Pages -> Source: "Deploy from a
+# branch", Branch: `gh-pages`, folder `/ (root)`.
 
 on:
   push:
-    branches: [main, claude/marketplace-event-layer-oca24c]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
-  contents: read
-  pages: write
-  id-token: write
+  contents: write
 
 concurrency:
-  group: pages
+  group: docs
   cancel-in-progress: false
 
 jobs:
-  build:
+  publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,25 +57,30 @@ jobs:
         run: dbt docs generate --profiles-dir . --target ci --static
 
       # --static emits one self-contained HTML file with the manifest and
-      # catalog inlined. Serving that as index.html avoids the CORS problems
-      # the multi-file docs site hits on Pages.
+      # catalog inlined, which avoids the CORS problems the multi-file docs site
+      # hits when served from Pages.
       - name: Assemble the site
         run: |
-          mkdir -p site
+          rm -rf site && mkdir -p site
           cp dbt/target/static_index.html site/index.html
           cp dbt/target/manifest.json dbt/target/catalog.json site/
           touch site/.nojekyll
 
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: site
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@v4
+      # A fresh orphan commit force-pushed each time, so gh-pages never
+      # accumulates history. The site is a 4 MB generated artefact; keeping
+      # every past version of it would bloat the repository for no benefit.
+      - name: Publish to gh-pages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd site
+          git init -q
+          git checkout -q -b gh-pages
+          git add -A
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -qm "dbt docs for ${GITHUB_SHA::7}"
+          git push -q --force \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            gh-pages
+          echo "Published dbt docs for ${GITHUB_SHA::7} to gh-pages."
