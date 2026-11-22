@@ -14,8 +14,8 @@ and is written down below rather than left implicit in SQL.
 
 - **Lineage docs:** <https://shivangd1508.github.io/-marketplace-analytics/> —
   published from `dbt docs generate`, clickable DAG, every model and column
-  documented. *(Needs GitHub Pages set to "GitHub Actions" once, in repo
-  Settings → Pages.)*
+  documented. *(Needs GitHub Pages pointed once at the `gh-pages` branch, in
+  repo Settings → Pages — see [Documentation](#documentation).)*
 - **Analysis:** [ANALYSIS.md](ANALYSIS.md) — funnel drop-off, retention curves,
   delivery time by region.
 
@@ -404,6 +404,36 @@ The four singular tests each guard something no generic test can express:
 | [`assert_funnel_steps_monotonic`](dbt/tests/assert_funnel_steps_monotonic.sql) | A funnel must not widen as it descends. Monotonicity is structural in `fct_funnel_steps`, but "structural" is a claim about a window frame; change the partition and the guarantee vanishes while every row count still looks plausible. |
 | [`assert_events_reconcile_to_source_rows`](dbt/tests/assert_events_reconcile_to_source_rows.sql) | Nine union'd CTEs each with their own `WHERE`. A wrong predicate in one loses events silently — the model builds, uniqueness passes, the funnel just reports a smaller number. Nine row-count identities against the raw tables. |
 | [`assert_sessions_partition_buyer_events`](dbt/tests/assert_sessions_partition_buyer_events.sql) | Gap-based sessionization is three stacked window functions; a mismatched `ORDER BY` between them double-counts events at boundaries without breaking uniqueness on `session_id`. Reconciles event totals and buyer sets in both directions. |
+
+---
+
+# Documentation
+
+`dbt docs generate --static` produces one self-contained HTML file with the
+manifest and catalog inlined — model and column descriptions, every test,
+compiled SQL, and the clickable lineage graph. The `dbt docs` workflow builds it
+on every push to `main` and force-pushes it to the **`gh-pages`** branch.
+
+One-time repository setup: **Settings → Pages → Source: "Deploy from a branch",
+Branch: `gh-pages`, folder `/ (root)`.**
+
+### Why a branch rather than `actions/deploy-pages`
+
+The project originally used the official Pages deployment action, which
+publishes through the protected `github-pages` environment. That environment's
+deployment-branch rule is pinned to whatever the default branch was when Pages
+was first enabled — here, a feature branch. Once `main` became the default,
+every deploy was rejected *before the job started*: two seconds, no runner, no
+logs, and a build that otherwise looked healthy. The docs site silently served a
+stale commit for days.
+
+Force-pushing a branch needs only `contents: write` and depends on no
+environment, so the publish step can no longer be broken by a setting that is
+invisible from the build. Each run pushes a fresh orphan commit, so `gh-pages`
+never accumulates history — the site is a 4 MB generated artefact and keeping
+every past version of it would bloat the repository for nothing.
+
+Build it locally with `make docs`, or `make serve-docs` to open it on :8080.
 
 ---
 
